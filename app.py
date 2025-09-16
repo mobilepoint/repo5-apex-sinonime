@@ -62,6 +62,23 @@ def load_sku_alternative_from_supabase(url: str, anon_key: str) -> pd.DataFrame:
         df["nume"] = normalize_str_series(df["nume"])
     df = df[(df["cod alternativ"] != "") & (df["cod principal"] != "")]
     return df
+import os
+import streamlit as st
+
+def mask(s, keep=4):
+    if not s:
+        return "«empty»"
+    return s[:keep] + "…" + s[-keep:]
+
+with st.expander("🔍 Secrets Doctor", expanded=False):
+    st.write("Chei de top-level în st.secrets:", list(st.secrets.keys()))
+    sb = st.secrets.get("supabase", {})
+    st.write("Are secțiune [supabase]? ->", bool(sb))
+    if sb:
+        st.write("  - url:", mask(sb.get("url", "")))
+        st.write("  - anon_key:", mask(sb.get("anon_key", "")))
+    else:
+        st.info("Nu există [supabase] în st.secrets. Vezi pașii de mai jos.")
 
 # =============== SECRETS ===============
 SUPABASE_URL = st.secrets.get("supabase", {}).get("url", "")
