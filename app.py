@@ -26,13 +26,13 @@ def normalize_str_series(s: pd.Series) -> pd.Series:
     return s.astype(str).str.strip()
 
 @st.cache_data(show_spinner=False)
-def load_sku_alternative_from_supabase(url: str, anon_key: str) -> pd.DataFrame:
-    """Citește tabelul sku_alternative din Supabase și normalizează coloanele.
+def load_sku_sinonime_from_supabase(url: str, anon_key: str) -> pd.DataFrame:
+    """Citește tabelul sku_sinonime din Supabase și normalizează coloanele.
        Headere acceptate: COD ALTERNATIV, COD PRINCIPAL, NUME
     """
     from supabase import create_client
     client = create_client(url, anon_key)
-    resp = client.table("sku_alternative").select("*").execute()
+    resp = client.table("sku_sinonime").select("*").execute()
     data = resp.data or []
     df = pd.DataFrame(data)
     if df.empty:
@@ -108,7 +108,7 @@ if SUPABASE_URL and SUPABASE_ANON:
         from supabase import create_client
         _client = create_client(SUPABASE_URL, SUPABASE_ANON)
         # ping ușor (nu consumă mult): doar head table sau count
-        _ = _client.table("sku_alternative").select("count", count="exact").limit(1).execute()
+        _ = _client.table("sku_sinonime").select("count", count="exact").limit(1).execute()
         st.success("Conexiune Supabase OK ✅")
     except Exception as e:
         st.error(f"Conexiune Supabase eșuată: {e}")
@@ -120,7 +120,7 @@ else:
 
 # =============== UI ===============
 st.title("Generator comandă APEX (cu sinonime din Supabase)")
-st.write("Încarcă APEX (CSV) și SmartBill (Excel). Maparea de sinonime SKU se citește din `sku_alternative` (Supabase).")
+st.write("Încarcă APEX (CSV) și SmartBill (Excel). Maparea de sinonime SKU se citește din `sku_sinonime` (Supabase).")
 
 apex_file = st.file_uploader("Fișier APEX (.csv)", type=["csv"])
 smartbill_file = st.file_uploader("Fișier SmartBill (.xlsx, .xls)", type=["xlsx", "xls"])
@@ -154,9 +154,9 @@ if apex_file and smartbill_file:
 
     # --- Sinonime din Supabase
     try:
-        sku_alt_df = load_sku_alternative_from_supabase(SUPABASE_URL, SUPABASE_ANON)
+        sku_alt_df = load_sku_sinonime_from_supabase(SUPABASE_URL, SUPABASE_ANON)
     except Exception as e:
-        st.error(f"Nu am putut citi `sku_alternative` din Supabase: {e}")
+        st.error(f"Nu am putut citi `sku_sinonime` din Supabase: {e}")
         st.stop()
 
     alt_to_principal = {}
@@ -246,7 +246,7 @@ if apex_file and smartbill_file:
     )
 
     with st.expander("Diagnostic mapare sinonime"):
-        st.write("Rânduri în `sku_alternative`:", len(sku_alt_df))
+        st.write("Rânduri în `sku_sinonime`:", len(sku_alt_df))
         if not sku_alt_df.empty:
             st.dataframe(sku_alt_df.head(50), use_container_width=True)
         st.write("Coduri APEX unice:", apex_df["cod"].nunique())
