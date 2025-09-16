@@ -80,13 +80,43 @@ with st.expander("🔍 Secrets Doctor", expanded=False):
     else:
         st.info("Nu există [supabase] în st.secrets. Vezi pașii de mai jos.")
 
-# =============== SECRETS ===============
-SUPABASE_URL = st.secrets.get("supabase", {}).get("url", "")
-SUPABASE_ANON = st.secrets.get("supabase", {}).get("anon_key", "")
+# =============== SECRETS ROBUST ===============
+import os
 
+def get_supabase_creds():
+    # 1) Streamlit Secrets
+    sb = st.secrets.get("supabase", {})
+    url = sb.get("url", "")
+    key = sb.get("anon_key", "")
+    # 2) ENV (în caz că rulezi local pe Docker, GitHub Codespaces etc.)
+    url = url or os.getenv("SUPABASE_URL", "")
+    key = key or os.getenv("SUPABASE_ANON_KEY", "")
+    return url.strip(), key.strip()
+
+SUPABASE_URL, SUPABASE_ANON = get_supabase_creds()
+
+# 3) Dacă lipsesc, oferă input-uri în UI ca să nu te blochezi
 if not SUPABASE_URL or not SUPABASE_ANON:
-    st.error("Completează .streamlit/secrets.toml cu supabase.url și supabase.anon_key.")
+    st.warning("Nu găsesc Supabase URL / Anon Key. Completează mai jos sau setează-le în Secrets.")
+    c1, c2 = st.columns([1,2])
+    SUPABASE_URL = c1.text_input("Supabase URL", value=SUPABASE_URL, placeholder="https://xxxx.supabase.co")
+    SUPABASE_ANON = c2.text_input("Supabase Anon Key", value=SUPABASE_ANON, placeholder="eyJhbGciOi...", type="password")
+
+# 4) Mic test de conectare ca să vezi un mesaj clar
+if SUPABASE_URL and SUPABASE_ANON:
+    try:
+        from supabase import create_client
+        _client = create_client(SUPABASE_URL, SUPABASE_ANON)
+        # ping ușor (nu consumă mult): doar head table sau count
+        _ = _client.table("sku_alternative").select("count", count="exact").limit(1).execute()
+        st.success("Conexiune Supabase OK ✅")
+    except Exception as e:
+        st.error(f"Conexiune Supabase eșuată: {e}")
+        st.stop()
+else:
+    st.error("Completează Supabase URL și Anon Key (sau setează-le în Secrets) și dă Rerun.")
     st.stop()
+
 
 # =============== UI ===============
 st.title("Generator comandă APEX (cu sinonime din Supabase)")
