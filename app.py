@@ -1,11 +1,26 @@
+# app.py — Generator comandă APEX (cu mapare SKU din Supabase: primary + aliasuri)
+
 import io
+import math
+import re
+from decimal import Decimal, InvalidOperation
+
 import pandas as pd
 import streamlit as st
+from sqlalchemy import create_engine, text
 
-ALLOWED_ROUNDINGS = [1, 3, 5, 10, 20, 50]
+# =========================
+#   CONFIG & CONSTANTE
+# =========================
 st.set_page_config(page_title="Generator comandă APEX", layout="wide")
+ALLOWED_ROUNDINGS = [1, 3, 5, 10, 20, 50]
 
-# =============== HELPERS ===============
+st.title("Generator comandă APEX (mapare pe baza catalogului din Supabase)")
+st.caption("Folosește catalog.product + catalog.product_sku (primar + aliasuri).")
+
+# =========================
+#   HELPER FUNCTIONS
+# =========================
 def round_to_allowed(value: float) -> int:
     """Rotunjește la cea mai apropiată valoare din lista permisă (ceiling pe praguri)."""
     for threshold in ALLOWED_ROUNDINGS:
@@ -14,6 +29,7 @@ def round_to_allowed(value: float) -> int:
     return ALLOWED_ROUNDINGS[-1]
 
 def compute_order(row: pd.Series) -> int:
+    """Heuristică simplă: dacă ieșirile > stoc final => comandă la un prag permis."""
     iesiri = row.get("iesiri", 0)
     stoc_final = row.get("stoc final", 0)
     if pd.isna(iesiri) or pd.isna(stoc_final):
@@ -25,186 +41,162 @@ def compute_order(row: pd.Series) -> int:
 def normalize_str_series(s: pd.Series) -> pd.Series:
     return s.astype(str).str.strip()
 
-@st.cache_data(show_spinner=False)
-def load_sku_sinonime_from_supabase(url: str, anon_key: str) -> pd.DataFrame:
-    """Citește tabelul sku_sinonime din Supabase și normalizează coloanele.
-       Headere acceptate: COD ALTERNATIV, COD PRINCIPAL, NUME
-    """
-    from supabase import create_client
-    client = create_client(url, anon_key)
-    resp = client.table("sku_sinonime").select("*").execute()
-    data = resp.data or []
-    df = pd.DataFrame(data)
-    if df.empty:
-        return pd.DataFrame(columns=["cod alternativ", "cod principal", "nume"])
+def canon_sku(x: str) -> str:
+    """Curăță SKU: spații, notație științifică (ex: 5.6061E+11) -> cifre fără exponent."""
+    if x is None:
+        return ""
+    s = str(x).strip().replace(" ", "")
+    if s == "":
+        return ""
+    # scientific notation?
+    if re.match(r"^[0-9]+(\.[0-9]+)?[eE]\+[0-9]+$", s):
+        try:
+            d = Decimal(s)  # precizie arbitrară; nu pierdem zerouri interioare
+            s = format(d, 'f').replace(".", "")
+        except InvalidOperation:
+            pass
+    return s
 
-    # Normalizează headerele
-    df.columns = df.columns.str.strip().str.lower()
-    rename_map = {}
-    for col in df.columns:
-        if col.replace("_", " ") == "cod alternativ":
-            rename_map[col] = "cod alternativ"
-        if col.replace("_", " ") == "cod principal":
-            rename_map[col] = "cod principal"
-        if col in {"nume", "nume produs", "denumire"}:
-            rename_map[col] = "nume"
-    if rename_map:
-        df = df.rename(columns=rename_map)
-
-    required = {"cod alternativ", "cod principal"}
-    if not required.issubset(df.columns):
-        # întoarce cadru gol dar cu headerele potrivite, ca să nu pice aplicația
-        return pd.DataFrame(columns=["cod alternativ", "cod principal", "nume"])
-
-    df["cod alternativ"] = normalize_str_series(df["cod alternativ"])
-    df["cod principal"] = normalize_str_series(df["cod principal"])
-    if "nume" in df.columns:
-        df["nume"] = normalize_str_series(df["nume"])
-    df = df[(df["cod alternativ"] != "") & (df["cod principal"] != "")]
-    return df
-import os
-import streamlit as st
-
-def mask(s, keep=4):
-    if not s:
-        return "«empty»"
-    return s[:keep] + "…" + s[-keep:]
-
-with st.expander("🔍 Secrets Doctor", expanded=False):
-    st.write("Chei de top-level în st.secrets:", list(st.secrets.keys()))
-    sb = st.secrets.get("supabase", {})
-    st.write("Are secțiune [supabase]? ->", bool(sb))
-    if sb:
-        st.write("  - url:", mask(sb.get("url", "")))
-        st.write("  - anon_key:", mask(sb.get("anon_key", "")))
-    else:
-        st.info("Nu există [supabase] în st.secrets. Vezi pașii de mai jos.")
-
-# =============== SECRETS ROBUST ===============
-import os
-
-def get_supabase_creds():
-    # 1) Streamlit Secrets
-    sb = st.secrets.get("supabase", {})
-    url = sb.get("url", "")
-    key = sb.get("anon_key", "")
-    # 2) ENV (în caz că rulezi local pe Docker, GitHub Codespaces etc.)
-    url = url or os.getenv("SUPABASE_URL", "")
-    key = key or os.getenv("SUPABASE_ANON_KEY", "")
-    return url.strip(), key.strip()
-
-SUPABASE_URL, SUPABASE_ANON = get_supabase_creds()
-
-# 3) Dacă lipsesc, oferă input-uri în UI ca să nu te blochezi
-if not SUPABASE_URL or not SUPABASE_ANON:
-    st.warning("Nu găsesc Supabase URL / Anon Key. Completează mai jos sau setează-le în Secrets.")
-    c1, c2 = st.columns([1,2])
-    SUPABASE_URL = c1.text_input("Supabase URL", value=SUPABASE_URL, placeholder="https://xxxx.supabase.co")
-    SUPABASE_ANON = c2.text_input("Supabase Anon Key", value=SUPABASE_ANON, placeholder="eyJhbGciOi...", type="password")
-
-# 4) Mic test de conectare ca să vezi un mesaj clar
-if SUPABASE_URL and SUPABASE_ANON:
-    try:
-        from supabase import create_client
-        _client = create_client(SUPABASE_URL, SUPABASE_ANON)
-        # ping ușor (nu consumă mult): doar head table sau count
-        _ = _client.table("sku_sinonime").select("count", count="exact").limit(1).execute()
-        st.success("Conexiune Supabase OK ✅")
-    except Exception as e:
-        st.error(f"Conexiune Supabase eșuată: {e}")
-        st.stop()
-else:
-    st.error("Completează Supabase URL și Anon Key (sau setează-le în Secrets) și dă Rerun.")
+# =========================
+#   CONEXIUNE DB (Supabase)
+# =========================
+# Adaugă în .streamlit/secrets.toml:
+# DATABASE_URL = "postgresql+psycopg2://postgres:<PAROLA>@<HOST>:6543/postgres"
+if "DATABASE_URL" not in st.secrets:
+    st.error("Lipsește DATABASE_URL în .streamlit/secrets.toml")
     st.stop()
 
+engine = create_engine(st.secrets["DATABASE_URL"], pool_pre_ping=True)
 
-# =============== UI ===============
-st.title("Generator comandă APEX (cu sinonime din Supabase)")
-st.write("Încarcă APEX (CSV) și SmartBill (Excel). Maparea de sinonime SKU se citește din `sku_sinonime` (Supabase).")
+@st.cache_data(ttl=600, show_spinner=False)
+def load_sku_mapping_from_db() -> pd.DataFrame:
+    """
+    Citește mapping-ul direct din catalog.product & catalog.product_sku.
+    Returnează: sku_any, primary_sku, denumire_db.
+    """
+    with engine.begin() as conn:
+        df_map = pd.read_sql(text("""
+            select 
+                p.id as product_id,
+                p.name as denumire_db,
+                ps.sku as sku_any,
+                max(ps.sku) filter (where ps.is_primary) over (partition by p.id) as primary_sku
+            from catalog.product p
+            join catalog.product_sku ps on ps.product_id = p.id
+        """), conn)
+    # asigură unicitate pe fiecare cod (alias sau principal)
+    df_map = df_map.drop_duplicates(subset=["sku_any"])
+    return df_map[["sku_any", "primary_sku", "denumire_db"]].copy()
 
-apex_file = st.file_uploader("Fișier APEX (.csv)", type=["csv"])
-smartbill_file = st.file_uploader("Fișier SmartBill (.xlsx, .xls)", type=["xlsx", "xls"])
+# =========================
+#   UI INPUT FILES
+# =========================
+st.subheader("Fișiere de intrare")
+left, right = st.columns(2)
+with left:
+    apex_file = st.file_uploader("Fișier APEX (.csv)", type=["csv"], key="apex")
+with right:
+    smartbill_file = st.file_uploader("Fișier SmartBill (.xlsx sau .xls)", type=["xlsx", "xls"], key="smartbill")
 
+# =========================
+#   LOGICĂ PRINCIPALĂ
+# =========================
 if apex_file and smartbill_file:
-    # --- APEX
-    apex_df = pd.read_csv(apex_file)
+    # 0) Încarcă mapping din DB
+    try:
+        df_map = load_sku_mapping_from_db()
+    except Exception as e:
+        st.error(f"Nu am putut citi mapping-ul din DB: {e}")
+        st.stop()
+
+    alt_to_principal = dict(zip(df_map["sku_any"].astype(str), df_map["primary_sku"].astype(str)))
+    sku_to_name      = dict(zip(df_map["sku_any"].astype(str), df_map["denumire_db"].astype(str)))
+    prim_to_name     = dict(zip(
+        df_map.drop_duplicates(subset=["primary_sku"])["primary_sku"].astype(str),
+        df_map.drop_duplicates(subset=["primary_sku"])["denumire_db"].astype(str)
+    ))
+
+    # 1) Citește APEX
+    try:
+        apex_df = pd.read_csv(apex_file)
+    except Exception as e:
+        st.error(f"Nu pot citi APEX CSV: {e}")
+        st.stop()
     apex_df.columns = apex_df.columns.str.strip().str.lower()
     if "cod" not in apex_df.columns:
         st.error("În APEX lipsește coloana 'cod'.")
         st.stop()
     apex_df["cod"] = normalize_str_series(apex_df["cod"])
+    # opțional nume produs din APEX (dacă există)
     possible_name_cols = ["nume", "denumire", "product name", "nume produs", "produs"]
     name_col_apex = next((c for c in possible_name_cols if c in apex_df.columns), None)
 
-    # --- SmartBill
+    # 2) Citește SmartBill
     try:
         smart_df = pd.read_excel(smartbill_file)
     except Exception as e:
-        st.error("Pentru .xls ai nevoie de `xlrd>=2.0.1`. Pentru .xlsx, de `openpyxl`.\nDetalii: {}".format(e))
+        st.error("Pentru .xls ai nevoie de xlrd>=2.0.1; pentru .xlsx, de openpyxl. Detalii: {}".format(e))
         st.stop()
     smart_df.columns = smart_df.columns.str.strip().str.lower()
     if "cod" not in smart_df.columns:
         st.error("În SmartBill lipsește coloana 'cod'.")
         st.stop()
-    smart_df["cod"] = normalize_str_series(smart_df["cod"])
+    for col in ["cod"]:
+        smart_df[col] = normalize_str_series(smart_df[col])
+    # Asigură numeric pt. iesiri + stoc final
     for col in ["iesiri", "stoc final"]:
         if col not in smart_df.columns:
             smart_df[col] = 0
         smart_df[col] = pd.to_numeric(smart_df[col], errors="coerce").fillna(0)
 
-    # --- Sinonime din Supabase
-    try:
-        sku_alt_df = load_sku_sinonime_from_supabase(SUPABASE_URL, SUPABASE_ANON)
-    except Exception as e:
-        st.error(f"Nu am putut citi `sku_sinonime` din Supabase: {e}")
-        st.stop()
+    # 3) Canonizare + mapare la SKU principal
+    apex_df["cod_canon"]  = apex_df["cod"].map(canon_sku)
+    smart_df["cod_canon"] = smart_df["cod"].map(canon_sku)
 
-    alt_to_principal = {}
-    if not sku_alt_df.empty:
-        alt_to_principal = dict(
-            sku_alt_df.drop_duplicates(subset=["cod alternativ"]).set_index("cod alternativ")["cod principal"]
-        )
+    apex_df["cod_match"]  = apex_df["cod_canon"].map(alt_to_principal).fillna(apex_df["cod_canon"])
+    smart_df["cod_match"] = smart_df["cod_canon"].map(alt_to_principal).fillna(smart_df["cod_canon"])
 
-    # --- cod_match
-    apex_df["cod_match"] = apex_df["cod"].map(alt_to_principal).fillna(apex_df["cod"])
-    smart_df["cod_match"] = smart_df["cod"].map(alt_to_principal).fillna(smart_df["cod"])
-
-    # --- Agregare SmartBill pe cod canonic
+    # 4) Agregare SmartBill pe cod canonic
     smart_grouped = smart_df.groupby("cod_match", as_index=False)[["iesiri", "stoc final"]].sum()
 
-    # --- Merge + comandă
+    # 5) Merge APEX + SB și calc comandă
     merged = apex_df.merge(smart_grouped, on="cod_match", how="left")
     for col in ["iesiri", "stoc final"]:
         if col not in merged.columns:
             merged[col] = 0
         merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
+
     merged["comanda"] = merged.apply(compute_order, axis=1)
 
-    st.subheader("Rezultat comandă")
-    show_cols = ["cod", "cod_match", "iesiri", "stoc final", "comanda"]
+    # 6) Anexează nume din DB (după SKU principal)
+    merged = merged.rename(columns={"cod_match": "SKU_principal"})
+    merged["Produs_DB"] = merged["SKU_principal"].map(prim_to_name)
+
+    # 7) Afișare rezultat
+    st.subheader("📦 Rezultat comandă (agregat pe SKU principal)")
+    show_cols = ["cod", "SKU_principal", "Produs_DB", "iesiri", "stoc final", "comanda"]
     if name_col_apex:
         show_cols.insert(1, name_col_apex)
     show_cols = [c for c in show_cols if c in merged.columns]
     st.dataframe(merged[show_cols], use_container_width=True)
 
-    # --- CSV principal
+    # 8) Export CSV
     csv_buffer = io.StringIO()
     merged.to_csv(csv_buffer, index=False)
     st.download_button(
-        label="Descarcă fișierul pentru furnizor (CSV)",
+        label="⬇️ Descarcă fișierul pentru furnizor (CSV)",
         data=csv_buffer.getvalue(),
         file_name="apex_comanda.csv",
         mime="text/csv",
     )
 
-    # =========================
-    #   RAPORT DISCREPANȚE (cu sinonime)
-    # =========================
+    # 9) Raport discrepanțe / diagnostic mapare
+    st.subheader("Raport discrepanțe APEX vs SmartBill (după mapare)")
     smart_canon_set = set(smart_grouped["cod_match"].unique())
-    apex_canon_set = set(apex_df["cod_match"].unique())
+    apex_canon_set  = set(apex_df["cod_match"].unique())
 
     in_apex_not_in_smart = apex_df.loc[~apex_df["cod_match"].isin(smart_canon_set), ["cod", "cod_match"]].copy()
-    in_apex_not_in_smart["categorie"] = "Lipsește în SmartBill (după mapare)"
+    in_apex_not_in_smart["categorie"] = "APEX: lipsește în SmartBill (după mapare)"
     if name_col_apex:
         in_apex_not_in_smart = in_apex_not_in_smart.merge(
             apex_df[["cod", name_col_apex]], on="cod", how="left"
@@ -214,7 +206,7 @@ if apex_file and smartbill_file:
 
     sb_zero = smart_grouped[(smart_grouped["stoc final"] == 0) & (smart_grouped["iesiri"] == 0)].copy()
     sb_zero_in_apex = sb_zero[sb_zero["cod_match"].isin(apex_canon_set)].copy()
-    sb_zero_in_apex["categorie"] = "SB 0 stoc & 0 mișcări (după mapare)"
+    sb_zero_in_apex["categorie"] = "SB: 0 stoc & 0 mișcări (după mapare)"
     if name_col_apex:
         apex_name_by_canon = (
             apex_df.drop_duplicates(subset=["cod_match"])[["cod_match", name_col_apex]]
@@ -233,26 +225,23 @@ if apex_file and smartbill_file:
         ignore_index=True,
     ).sort_values(["categorie", "cod_match", "cod"], kind="stable")
 
-    st.subheader("Raport discrepanțe APEX vs SmartBill (cu sinonime)")
     st.dataframe(discrepante, use_container_width=True)
 
     disc_buffer = io.StringIO()
     discrepante.to_csv(disc_buffer, index=False)
     st.download_button(
-        label="Descarcă raport discrepanțe (CSV)",
+        label="⬇️ Descarcă raport discrepanțe (CSV)",
         data=disc_buffer.getvalue(),
         file_name="apex_smartbill_discrepante.csv",
         mime="text/csv",
     )
 
-    with st.expander("Diagnostic mapare sinonime"):
-        st.write("Rânduri în `sku_sinonime`:", len(sku_alt_df))
-        if not sku_alt_df.empty:
-            st.dataframe(sku_alt_df.head(50), use_container_width=True)
+    with st.expander("Diagnostic mapare / seturi unice"):
+        st.write("SKU-uri în mapping (DB):", len(df_map))
         st.write("Coduri APEX unice:", apex_df["cod"].nunique())
         st.write("Coduri SmartBill unice:", smart_df["cod"].nunique())
         st.write("Coduri canonice APEX:", apex_df["cod_match"].nunique())
         st.write("Coduri canonice SmartBill:", smart_grouped["cod_match"].nunique())
 
 else:
-    st.info("Încarcă ambele fișiere pentru a continua.")
+    st.info("Încarcă ambele fișiere (APEX CSV + SmartBill XLS/XLSX) pentru a continua.")
