@@ -1,6 +1,5 @@
 streamlit
 pandas
-sqlalchemy
-psycopg2-binary
+supabase>=2.4.0
 openpyxl
 xlrd>=2.0.1
