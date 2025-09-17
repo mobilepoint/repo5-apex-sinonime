@@ -143,24 +143,49 @@ def _find_by_variants(headers_clean: list, keys: list):
                 return i
     return None
 
+def _dedupe_columns(labels):
+    """Dacă există coloane cu același nume, adaugă sufixe .2, .3 etc."""
+    seen = {}
+    out = []
+    for lbl in [str(x) for x in labels]:
+        base = lbl
+        if base not in seen:
+            seen[base] = 1
+            out.append(base)
+        else:
+            seen[base] += 1
+            out.append(f"{base}.{seen[base]}")
+    return out
+
 def _promote_header_row(df: pd.DataFrame):
-    """Caută în primele rânduri headerul real și îl promovează.
-    Elimină coloanele complet goale prin INDEX (sigur și cu headere duplicate)."""
+    """Găsește rândul de header și îl promovează.
+    Elimină coloanele complet goale prin POZIȚIE și dedup-uează headerele."""
     max_scan = min(50, len(df))
     for r in range(max_scan):
         row = df.iloc[r].tolist()
         clean = [_clean_header_cell(x) for x in row]
         if any("product" in c and "code" in c for c in clean) and any("product" in c and "name" in c for c in clean):
+            # setăm headerul
             new_headers = [str(x) for x in df.iloc[r].tolist()]
             df2 = df.iloc[r+1:].copy()
             df2.columns = new_headers
-            # drop empty columns BY POSITION (handles duplicate names)
-            empty_idx = [j for j in range(df2.shape[1])
-                         if df2.iloc[:, j].astype(str).str.strip().eq("").all()]
-            if empty_idx:
-                df2 = df2.drop(df2.columns[empty_idx], axis=1)
+
+            # --- elimină coloanele complet goale BY POSITION (evită reindex) ---
+            empty_pos = []
+            for j in range(df2.shape[1]):
+                col_txt = df2.iloc[:, j].astype(str)
+                col_txt = col_txt.replace({"nan": "", "None": ""})
+                if col_txt.str.strip().eq("").all():
+                    empty_pos.append(j)
+            if empty_pos:
+                keep_pos = [j for j in range(df2.shape[1]) if j not in set(empty_pos)]
+                df2 = df2.iloc[:, keep_pos]
+
+            # --- dedupe headerele ca să fie unice (dar păstrăm „startswith” util pt. match) ---
+            df2.columns = _dedupe_columns(df2.columns)
             return df2
     return df
+
 
 
 @st.cache_data(ttl=600, show_spinner=False)
