@@ -144,20 +144,24 @@ def _find_by_variants(headers_clean: list, keys: list):
     return None
 
 def _promote_header_row(df: pd.DataFrame):
-    """Caută în primele 30 rânduri un rând cu 'product code' + 'product name'."""
-    max_scan = min(30, len(df))
+    """Caută în primele rânduri headerul real și îl promovează.
+    Elimină coloanele complet goale prin INDEX (sigur și cu headere duplicate)."""
+    max_scan = min(50, len(df))
     for r in range(max_scan):
         row = df.iloc[r].tolist()
         clean = [_clean_header_cell(x) for x in row]
         if any("product" in c and "code" in c for c in clean) and any("product" in c and "name" in c for c in clean):
-            # setăm headerul
             new_headers = [str(x) for x in df.iloc[r].tolist()]
             df2 = df.iloc[r+1:].copy()
             df2.columns = new_headers
-            # aruncăm coloanele complet goale
-            empty_cols = [c for c in df2.columns if df2[c].astype(str).str.strip().eq("").all()]
-            return df2.drop(columns=empty_cols, errors="ignore")
-    return df  # dacă nu găsim, lăsăm cum e
+            # drop empty columns BY POSITION (handles duplicate names)
+            empty_idx = [j for j in range(df2.shape[1])
+                         if df2.iloc[:, j].astype(str).str.strip().eq("").all()]
+            if empty_idx:
+                df2 = df2.drop(df2.columns[empty_idx], axis=1)
+            return df2
+    return df
+
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_sku_mapping_from_supabase() -> pd.DataFrame:
@@ -203,16 +207,15 @@ def _safe_header_map(df: pd.DataFrame) -> dict:
     return {clean[i]: i for i in range(len(clean))}
 
 def normalize_apex_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Mapează coloanele cheie și elimină rândurile fără cod (robust la denumiri prescurtate)."""
+    """Mapează coloanele cheie și elimină rândurile fără cod (robust la denumiri prescurtate/duplicate)."""
     if df.empty:
         raise ValueError("Fișierul APEX nu conține date.")
-    # asigură headerele ca șiruri
     df = df.copy()
     df.columns = [str(c) for c in df.columns]
 
     head_clean = [_clean_header_cell(c) for c in df.columns]
 
-    # găsește indexii col. dorite (soft-match)
+    # găsește indexii coloanelor dorite (soft-match)
     idx_code  = _find_by_variants(head_clean, HEADER_VARIANTS["code"])
     idx_name  = _find_by_variants(head_clean, HEADER_VARIANTS["name"])
     idx_qty   = _find_by_variants(head_clean, HEADER_VARIANTS["qty"])
@@ -220,32 +223,33 @@ def normalize_apex_columns(df: pd.DataFrame) -> pd.DataFrame:
     idx_order = _find_by_variants(head_clean, HEADER_VARIANTS["order"])
 
     if idx_code is None:
-        # ultimul fallback: poate headerul e într-un rând de date — mai încercăm promovare încă o dată
         df2 = _promote_header_row(df)
         if df2 is not df:
-            return normalize_apex_columns(df2)  # recursie scurtă
+            return normalize_apex_columns(df2)
         raise ValueError("În APEX nu am găsit coloana «Product Code».")
-    # construiește DF minim
-    cols = []
-    rename = {}
-    def _add(idx, new_name):
-        if idx is not None:
-            cols.append(df.columns[idx])
-            rename[df.columns[idx]] = new_name
 
-    _add(idx_code, "cod_raw")
-    _add(idx_name, "nume_apex")
-    _add(idx_qty, "cantitate")
-    _add(idx_eur, "pret_eur")
+    # selectăm STRICT după INDEX ca să evităm probleme cu headere duplicate
+    idxs, names = [], []
+    def _add(idx, name):
+        if idx is not None:
+            idxs.append(idx); names.append(name)
+
+    _add(idx_code,  "cod_raw")
+    _add(idx_name,  "nume_apex")
+    _add(idx_qty,   "cantitate")
+    _add(idx_eur,   "pret_eur")
     _add(idx_order, "order_hint")
 
-    out = df[cols].copy().rename(columns=rename)
+    out = df.iloc[:, idxs].copy()
+    out.columns = names
+
     for c in out.columns:
         out[c] = out[c].astype(str).str.replace("\xa0", " ").str.strip()
 
     out["cod_raw"] = out["cod_raw"].replace({"nan": "", "None": ""})
     out = out[out["cod_raw"].astype(str).str.strip() != ""].copy()
     return out
+
 
 def expand_apex_rows(df_norm_cols: pd.DataFrame) -> pd.DataFrame:
     """Duplichează rândurile cu coduri multiple separate pe '/', aplicând regulile de prefix."""
