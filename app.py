@@ -1,4 +1,4 @@
-# app.py — Generator comandă APEX + normalizare + mapare SKU (Supabase client, fără DATABASE_URL)
+# app.py — Generator comandă APEX: normalizare (multi-sheet, auto-header) + mapare Supabase
 
 import io
 import re
@@ -57,8 +57,8 @@ def canon_sku(x: str) -> str:
     """Curăță spații, texte din paranteze și notație științifică menținând zerourile."""
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return ""
-    s = str(x).strip()
-    s = re.sub(r"\(.*?\)", "", s).strip()  # scoate (Asmbld) etc.
+    s = str(x).replace("\xa0", " ").strip()        # NBSP -> space
+    s = re.sub(r"\(.*?\)", "", s).strip()          # scoate (Asmbld) etc.
     s = s.replace(" ", "")
     if s == "":
         return ""
@@ -72,7 +72,7 @@ def canon_sku(x: str) -> str:
 
 def split_and_expand_codes(raw_code: str) -> list:
     """
-    Reguli:
+    Reguli de split:
       - prefix = TOT până la primul '-' din primul cod; dacă nu există '-', nu folosim prefix.
       - împărțim pe '/', segmentele fără '-' primesc prefix doar dacă există prefix.
     """
@@ -83,9 +83,7 @@ def split_and_expand_codes(raw_code: str) -> list:
     if not parts:
         return []
     first = parts[0]
-    prefix = ""
-    if "-" in first:
-        prefix = first[: first.find("-") + 1]  # include '-'
+    prefix = first[: first.find("-") + 1] if "-" in first else ""
     out = []
     for i, p in enumerate(parts):
         p = p.strip()
@@ -103,12 +101,11 @@ def parse_decimal_maybe(val) -> Decimal:
     """Extrage număr din '€ 12,34', '12.34', '12,34 EUR', '' sau NaN."""
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return Decimal("0")
-    txt = str(val).strip()
+    txt = str(val).replace("\xa0", " ").strip()
     txt = re.sub(r"[^\d,.\-]", "", txt)
     if txt == "" or txt in {".", ",", "-"}:
         return Decimal("0")
     if "," in txt and "." in txt:
-        # separator zecimal = ultimul semn dintre , și .
         if txt.rfind(",") > txt.rfind("."):
             txt = txt.replace(".", "").replace(",", ".")
         else:
@@ -119,6 +116,48 @@ def parse_decimal_maybe(val) -> Decimal:
         return Decimal(txt)
     except InvalidOperation:
         return Decimal("0")
+
+# --------- soft matching pe headere + auto-promote header row ----------
+HEADER_VARIANTS = {
+    "code":   ["product code", "product_code", "code", "cod", "code no", "prod code", "productcode"],
+    "name":   ["product name", "product_name", "name", "nume", "denumire", "description", "descriere"],
+    "qty":    ["quantity", "qty", "quant", "q-ty", "qnty"],
+    "eur":    ["euro price", "euro pri", "eur price", "euro", "eur", "price(€)", "price €", "€ price", "price eur"],
+    "order":  ["order", "ord", "order qty", "order_qty", "comanda", "orderhint", "order hint"],
+}
+
+def _clean_header_cell(x) -> str:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return ""
+    s = str(x).replace("\xa0", " ")
+    s = re.sub(r"[\r\n]+", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip().lower()
+
+def _find_by_variants(headers_clean: list, keys: list):
+    """Întoarce indexul primei potriviri 'soft' (startswith/equals) pentru oricare variantă."""
+    for i, h in enumerate(headers_clean):
+        for k in keys:
+            k0 = k.lower()
+            if h == k0 or h.startswith(k0):
+                return i
+    return None
+
+def _promote_header_row(df: pd.DataFrame):
+    """Caută în primele 30 rânduri un rând cu 'product code' + 'product name'."""
+    max_scan = min(30, len(df))
+    for r in range(max_scan):
+        row = df.iloc[r].tolist()
+        clean = [_clean_header_cell(x) for x in row]
+        if any("product" in c and "code" in c for c in clean) and any("product" in c and "name" in c for c in clean):
+            # setăm headerul
+            new_headers = [str(x) for x in df.iloc[r].tolist()]
+            df2 = df.iloc[r+1:].copy()
+            df2.columns = new_headers
+            # aruncăm coloanele complet goale
+            empty_cols = [c for c in df2.columns if df2[c].astype(str).str.strip().eq("").all()]
+            return df2.drop(columns=empty_cols, errors="ignore")
+    return df  # dacă nu găsim, lăsăm cum e
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_sku_mapping_from_supabase() -> pd.DataFrame:
@@ -136,63 +175,80 @@ def load_sku_mapping_from_supabase() -> pd.DataFrame:
     df = df.drop_duplicates(subset=["sku_any"])
     return df[["sku_any", "primary_sku", "denumire_db"]].copy()
 
+# --------- citire APEX (multi-sheet) ----------
 def read_any_apex(file) -> pd.DataFrame:
-    """Citește APEX (xlsx/xls/csv) exact cum vine și întoarce DF cu coloanele brute."""
+    """Citește APEX (xlsx/xls/csv). Dacă e Excel, procesează TOATE foile și le concatenează."""
     name = (file.name or "").lower()
+    frames = []
     if name.endswith(".csv"):
         df = pd.read_csv(file, dtype=str)
+        frames.append(df)
     else:
-        df = pd.read_excel(file, dtype=str)
-    # nu forțăm aici .lower() pe headere; unele pot fi NaN/float
-    return df
+        wb = pd.read_excel(file, dtype=str, sheet_name=None)  # dict sheet -> DF
+        for sheet, df in wb.items():
+            if df is None or df.empty:
+                continue
+            # dacă primul rând nu pare header, caută-l și promovează-l
+            df_fixed = _promote_header_row(df)
+            frames.append(df_fixed)
+    if not frames:
+        return pd.DataFrame()
+    df_all = pd.concat(frames, ignore_index=True)
+    return df_all
 
 def _safe_header_map(df: pd.DataFrame) -> dict:
-    """
-    Creează un dict {header_lower: header_original} ignorând NaN/Unnamed.
-    Evită .lower() pe non-string.
-    """
-    out = {}
-    for c in df.columns:
-        if c is None or (isinstance(c, float) and pd.isna(c)):
-            continue
-        raw = str(c).strip()
-        if raw == "" or raw.lower().startswith("unnamed:"):
-            continue
-        out[raw.lower()] = c
-    return out
+    """Map {header_clean: index} pe headerele actuale ale DataFrame-ului."""
+    headers = list(df.columns)
+    clean = [_clean_header_cell(h) for h in headers]
+    return {clean[i]: i for i in range(len(clean))}
 
 def normalize_apex_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Mapează coloanele cheie și elimină rândurile fără cod."""
-    cols_lower = _safe_header_map(df)
+    """Mapează coloanele cheie și elimină rândurile fără cod (robust la denumiri prescurtate)."""
+    if df.empty:
+        raise ValueError("Fișierul APEX nu conține date.")
+    # asigură headerele ca șiruri
+    df = df.copy()
+    df.columns = [str(c) for c in df.columns]
 
-    col_code  = cols_lower.get("product code") or cols_lower.get("product_code") or cols_lower.get("code") or cols_lower.get("cod")
-    col_name  = cols_lower.get("product name") or cols_lower.get("product_name") or cols_lower.get("nume") or cols_lower.get("denumire")
-    col_qty   = cols_lower.get("quantity")
-    col_price = cols_lower.get("euro price") or cols_lower.get("euro_price") or cols_lower.get("price")
-    col_order = cols_lower.get("order") or cols_lower.get("comanda") or cols_lower.get("order_hint")
+    head_clean = [_clean_header_cell(c) for c in df.columns]
 
-    if not col_code:
+    # găsește indexii col. dorite (soft-match)
+    idx_code  = _find_by_variants(head_clean, HEADER_VARIANTS["code"])
+    idx_name  = _find_by_variants(head_clean, HEADER_VARIANTS["name"])
+    idx_qty   = _find_by_variants(head_clean, HEADER_VARIANTS["qty"])
+    idx_eur   = _find_by_variants(head_clean, HEADER_VARIANTS["eur"])
+    idx_order = _find_by_variants(head_clean, HEADER_VARIANTS["order"])
+
+    if idx_code is None:
+        # ultimul fallback: poate headerul e într-un rând de date — mai încercăm promovare încă o dată
+        df2 = _promote_header_row(df)
+        if df2 is not df:
+            return normalize_apex_columns(df2)  # recursie scurtă
         raise ValueError("În APEX nu am găsit coloana «Product Code».")
-    keep = [c for c in [col_code, col_name, col_qty, col_price, col_order] if c]
-    df2 = df[keep].copy()
-
+    # construiește DF minim
+    cols = []
     rename = {}
-    if col_code:  rename[col_code]  = "cod_raw"
-    if col_name:  rename[col_name]  = "nume_apex"
-    if col_qty:   rename[col_qty]   = "cantitate"
-    if col_price: rename[col_price] = "pret_eur"
-    if col_order: rename[col_order] = "order_hint"
-    df2 = df2.rename(columns=rename)
+    def _add(idx, new_name):
+        if idx is not None:
+            cols.append(df.columns[idx])
+            rename[df.columns[idx]] = new_name
 
-    for c in df2.columns:
-        df2[c] = df2[c].astype(str).str.strip()
+    _add(idx_code, "cod_raw")
+    _add(idx_name, "nume_apex")
+    _add(idx_qty, "cantitate")
+    _add(idx_eur, "pret_eur")
+    _add(idx_order, "order_hint")
 
-    df2["cod_raw"] = df2["cod_raw"].replace({"nan": "", "None": ""})
-    df2 = df2[df2["cod_raw"].astype(str).str.strip() != ""].copy()
-    return df2
+    out = df[cols].copy().rename(columns=rename)
+    for c in out.columns:
+        out[c] = out[c].astype(str).str.replace("\xa0", " ").str.strip()
+
+    out["cod_raw"] = out["cod_raw"].replace({"nan": "", "None": ""})
+    out = out[out["cod_raw"].astype(str).str.strip() != ""].copy()
+    return out
 
 def expand_apex_rows(df_norm_cols: pd.DataFrame) -> pd.DataFrame:
-    """Duplichează rândurile cu coduri multiple separat pe '/', aplicând regulile de prefix."""
+    """Duplichează rândurile cu coduri multiple separate pe '/', aplicând regulile de prefix."""
     rows = []
     for _, r in df_norm_cols.iterrows():
         codes = split_and_expand_codes(r["cod_raw"])
@@ -237,8 +293,8 @@ apex_df_normalized = None
 if apex_file:
     st.markdown("### Pas 1 — Normalizare APEX")
     try:
-        apex_raw = read_any_apex(apex_file)
-        apex_trim = normalize_apex_columns(apex_raw)
+        apex_raw = read_any_apex(apex_file)           # citește toate foile & auto-header
+        apex_trim = normalize_apex_columns(apex_raw)  # mapare coloane cheie (soft)
         apex_df_normalized = expand_apex_rows(apex_trim)
     except Exception as e:
         st.error(f"Eroare la normalizare APEX: {e}")
