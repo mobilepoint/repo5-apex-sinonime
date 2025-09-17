@@ -54,17 +54,14 @@ def normalize_str_series(s: pd.Series) -> pd.Series:
     return s.astype(str).str.strip()
 
 def canon_sku(x: str) -> str:
-    """Curăță spații, sufixe paranteze și notație științifică menținând zerourile."""
-    if x is None:
+    """Curăță spații, texte din paranteze și notație științifică menținând zerourile."""
+    if x is None or (isinstance(x, float) and pd.isna(x)):
         return ""
     s = str(x).strip()
-    # elimină orice text din paranteze
-    s = re.sub(r"\(.*?\)", "", s).strip()
-    # scoate spațiile
+    s = re.sub(r"\(.*?\)", "", s).strip()  # scoate (Asmbld) etc.
     s = s.replace(" ", "")
     if s == "":
         return ""
-    # științific (doar cifre + exponent)
     if re.match(r"^[0-9]+(\.[0-9]+)?[eE]\+[0-9]+$", s):
         try:
             d = Decimal(s)
@@ -76,59 +73,48 @@ def canon_sku(x: str) -> str:
 def split_and_expand_codes(raw_code: str) -> list:
     """
     Reguli:
-      - prefix = tot până la primul '-' din PRIMUL cod; dacă nu există '-', NU folosim prefix.
-      - se împarte pe '/', segmentele fără '-' primesc prefix doar dacă există prefix.
-      - segmentele care conțin deja '-' rămân așa.
+      - prefix = TOT până la primul '-' din primul cod; dacă nu există '-', nu folosim prefix.
+      - împărțim pe '/', segmentele fără '-' primesc prefix doar dacă există prefix.
     """
-    if pd.isna(raw_code):
-        return []
-    s = canon_sku(str(raw_code))
+    s = canon_sku(raw_code)
     if s == "":
         return []
     parts = [p for p in s.split("/") if p != ""]
     if not parts:
         return []
     first = parts[0]
-    m = re.search(r"-")
     prefix = ""
-    if m:  # există '-' în primul cod
-        # „tot până la primul '-'”, inclusiv '-'
-        idx = first.find("-")
-        prefix = first[: idx + 1]  # include '-'
-
+    if "-" in first:
+        prefix = first[: first.find("-") + 1]  # include '-'
     out = []
     for i, p in enumerate(parts):
         p = p.strip()
         if i > 0 and prefix and "-" not in p:
             p = prefix + p
         out.append(canon_sku(p))
-
-    # elimină duplicate păstrând ordinea
+    # dedupe păstrând ordinea
     seen, uniq = set(), []
     for c in out:
         if c and c not in seen:
-            uniq.append(c)
-            seen.add(c)
+            uniq.append(c); seen.add(c)
     return uniq
 
-def parse_decimal_maybe(s: str) -> Decimal:
-    """Extrage număr din șiruri de tip '€ 12,34', '12.34', '12,34 EUR' etc."""
-    if s is None:
+def parse_decimal_maybe(val) -> Decimal:
+    """Extrage număr din '€ 12,34', '12.34', '12,34 EUR', '' sau NaN."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
         return Decimal("0")
-    txt = str(s).strip()
-    # scoate litere, simboluri valută
+    txt = str(val).strip()
     txt = re.sub(r"[^\d,.\-]", "", txt)
-    # dacă are atât virgulă cât și punct, alegem varianta în care separatorul zecimal pare ultimul
+    if txt == "" or txt in {".", ",", "-"}:
+        return Decimal("0")
     if "," in txt and "." in txt:
-        # dacă ultima apariție e virgulă -> înlocuim punctele (mii)
+        # separator zecimal = ultimul semn dintre , și .
         if txt.rfind(",") > txt.rfind("."):
             txt = txt.replace(".", "").replace(",", ".")
         else:
             txt = txt.replace(",", "")
-    else:
-        # doar virgulă -> zecimal
-        if "," in txt and "." not in txt:
-            txt = txt.replace(",", ".")
+    elif "," in txt:
+        txt = txt.replace(",", ".")
     try:
         return Decimal(txt)
     except InvalidOperation:
@@ -136,10 +122,7 @@ def parse_decimal_maybe(s: str) -> Decimal:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_sku_mapping_from_supabase() -> pd.DataFrame:
-    """Citește mappingul (alias -> primary) din view-ul public.v_sku_mapping, cu paginare."""
-    batch = 1000
-    start = 0
-    rows = []
+    batch, start, rows = 1000, 0, []
     while True:
         resp = client.table("v_sku_mapping").select("*").range(start, start + batch - 1).execute()
         data = resp.data or []
@@ -155,17 +138,33 @@ def load_sku_mapping_from_supabase() -> pd.DataFrame:
 
 def read_any_apex(file) -> pd.DataFrame:
     """Citește APEX (xlsx/xls/csv) exact cum vine și întoarce DF cu coloanele brute."""
-    name = file.name.lower()
+    name = (file.name or "").lower()
     if name.endswith(".csv"):
         df = pd.read_csv(file, dtype=str)
     else:
         df = pd.read_excel(file, dtype=str)
-    df.columns = df.columns.str.strip()
+    # nu forțăm aici .lower() pe headere; unele pot fi NaN/float
     return df
 
+def _safe_header_map(df: pd.DataFrame) -> dict:
+    """
+    Creează un dict {header_lower: header_original} ignorând NaN/Unnamed.
+    Evită .lower() pe non-string.
+    """
+    out = {}
+    for c in df.columns:
+        if c is None or (isinstance(c, float) and pd.isna(c)):
+            continue
+        raw = str(c).strip()
+        if raw == "" or raw.lower().startswith("unnamed:"):
+            continue
+        out[raw.lower()] = c
+    return out
+
 def normalize_apex_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Mapează coloanele la setul minim necesar și curăță rândurile fără cod."""
-    cols_lower = {c.lower(): c for c in df.columns}
+    """Mapează coloanele cheie și elimină rândurile fără cod."""
+    cols_lower = _safe_header_map(df)
+
     col_code  = cols_lower.get("product code") or cols_lower.get("product_code") or cols_lower.get("code") or cols_lower.get("cod")
     col_name  = cols_lower.get("product name") or cols_lower.get("product_name") or cols_lower.get("nume") or cols_lower.get("denumire")
     col_qty   = cols_lower.get("quantity")
@@ -190,11 +189,10 @@ def normalize_apex_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     df2["cod_raw"] = df2["cod_raw"].replace({"nan": "", "None": ""})
     df2 = df2[df2["cod_raw"].astype(str).str.strip() != ""].copy()
-
     return df2
 
 def expand_apex_rows(df_norm_cols: pd.DataFrame) -> pd.DataFrame:
-    """Duplichează rândurile cu coduri multiple separate prin '/', aplicând regulile de prefix."""
+    """Duplichează rândurile cu coduri multiple separat pe '/', aplicând regulile de prefix."""
     rows = []
     for _, r in df_norm_cols.iterrows():
         codes = split_and_expand_codes(r["cod_raw"])
@@ -202,22 +200,22 @@ def expand_apex_rows(df_norm_cols: pd.DataFrame) -> pd.DataFrame:
             continue
         for c in codes:
             new_r = r.copy()
-            new_r["cod"] = c  # cod final normalizat
+            new_r["cod"] = c
             rows.append(new_r)
+
     if not rows:
         return pd.DataFrame(columns=list(df_norm_cols.columns) + ["cod"])
+
     out = pd.DataFrame(rows)
     out["cod"] = out["cod"].astype(str).str.replace(" ", "", regex=False).str.strip()
 
-    # === PREȚ LEI: pret_eur * 5.1 (Decimal, 2 zecimale) ===
+    # === PREȚ LEI: pret_eur * 5.1 (2 zecimale) ===
     if "pret_eur" in out.columns:
-        eur_num = out["pret_eur"].map(parse_decimal_maybe)
-        lei_num = (eur_num * EUR_TO_RON).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        out["pret_lei"] = lei_num.astype(str)  # ca text în CSV
+        eur_num = out["pret_eur"].apply(parse_decimal_maybe)
+        out["pret_lei"] = eur_num.apply(lambda x: (x * EUR_TO_RON).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)).astype(str)
     else:
         out["pret_lei"] = ""
 
-    # curățăm dubluri perfecte
     out = out.drop_duplicates().reset_index(drop=True)
     return out
 
@@ -240,29 +238,19 @@ if apex_file:
     st.markdown("### Pas 1 — Normalizare APEX")
     try:
         apex_raw = read_any_apex(apex_file)
-    except Exception as e:
-        st.error(f"Nu pot citi fișierul APEX: {e}")
-        st.stop()
-
-    try:
         apex_trim = normalize_apex_columns(apex_raw)
         apex_df_normalized = expand_apex_rows(apex_trim)
     except Exception as e:
         st.error(f"Eroare la normalizare APEX: {e}")
         st.stop()
 
-    st.success("APEX a fost normalizat. Rândurile fără «Product Code» eliminate; codurile multiple au fost despărțite conform regulilor; «pret_lei» a fost calculat.")
+    st.success("APEX normalizat: rânduri fără «Product Code» eliminate; codurile multiple separate; «pret_lei» calculat.")
     cols_show_norm = [c for c in ["cod", "nume_apex", "cantitate", "pret_eur", "pret_lei", "order_hint"] if c in apex_df_normalized.columns]
     st.dataframe(apex_df_normalized[cols_show_norm].fillna(""), use_container_width=True)
 
     csv_buf = io.StringIO()
     apex_df_normalized.to_csv(csv_buf, index=False, quoting=csv.QUOTE_MINIMAL)
-    st.download_button(
-        "⬇️ Descarcă APEX normalizat (CSV)",
-        data=csv_buf.getvalue(),
-        file_name="apex_normalizat.csv",
-        mime="text/csv",
-    )
+    st.download_button("⬇️ Descarcă APEX normalizat (CSV)", data=csv_buf.getvalue(), file_name="apex_normalizat.csv", mime="text/csv")
 
 if apex_df_normalized is not None and smartbill_file:
     st.markdown("---")
@@ -302,13 +290,12 @@ if apex_df_normalized is not None and smartbill_file:
             smart_df[col] = 0
         smart_df[col] = pd.to_numeric(smart_df[col], errors="coerce").fillna(0)
 
-    # 3) Canonizare + mapare la SKU principal
+    # 3) Canonizare + mapare
     smart_df["cod_canon"] = smart_df["cod"].map(canon_sku)
-
     apex_df["cod_match"]  = apex_df["cod_canon"].map(alt_to_principal).fillna(apex_df["cod_canon"])
     smart_df["cod_match"] = smart_df["cod_canon"].map(alt_to_principal).fillna(smart_df["cod_canon"])
 
-    # 4) Agregare SmartBill pe cod canonic
+    # 4) Agregare SmartBill
     smart_grouped = smart_df.groupby("cod_match", as_index=False)[["iesiri", "stoc final"]].sum()
 
     # 5) Merge + comandă
@@ -319,32 +306,25 @@ if apex_df_normalized is not None and smartbill_file:
         merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
     merged["comanda"] = merged.apply(compute_order, axis=1)
 
-    # 6) Nume DB (după SKU principal)
+    # 6) Nume DB
     merged = merged.rename(columns={"cod_match": "SKU_principal"})
     merged["Produs_DB"] = merged["SKU_principal"].map(prim_to_name)
 
-    # 7) Afișare rezultat
+    # 7) Afișare
     st.subheader("📦 Rezultat comandă (agregat pe SKU principal)")
     show_cols = ["cod", "SKU_principal", "Produs_DB", "iesiri", "stoc final", "comanda"]
     if name_col_apex:
         show_cols.insert(1, name_col_apex)
-    # includ și prețurile în vizualizare dacă vrei să le vezi aici
     for extra in ["pret_eur", "pret_lei"]:
         if extra in merged.columns and extra not in show_cols:
             show_cols.append(extra)
-
     show_cols = [c for c in show_cols if c in merged.columns]
     st.dataframe(merged[show_cols], use_container_width=True)
 
     # 8) Export CSV
     out_csv = io.StringIO()
     merged.to_csv(out_csv, index=False, quoting=csv.QUOTE_MINIMAL)
-    st.download_button(
-        label="⬇️ Descarcă fișierul pentru furnizor (CSV)",
-        data=out_csv.getvalue(),
-        file_name="apex_comanda.csv",
-        mime="text/csv",
-    )
+    st.download_button("⬇️ Descarcă fișierul pentru furnizor (CSV)", data=out_csv.getvalue(), file_name="apex_comanda.csv", mime="text/csv")
 
     # 9) Raport discrepanțe
     st.subheader("Raport discrepanțe APEX vs SmartBill (după mapare)")
@@ -385,12 +365,7 @@ if apex_df_normalized is not None and smartbill_file:
 
     disc_buffer = io.StringIO()
     discrepante.to_csv(disc_buffer, index=False, quoting=csv.QUOTE_MINIMAL)
-    st.download_button(
-        label="⬇️ Descarcă raport discrepanțe (CSV)",
-        data=disc_buffer.getvalue(),
-        file_name="apex_smartbill_discrepante.csv",
-        mime="text/csv",
-    )
+    st.download_button("⬇️ Descarcă raport discrepanțe (CSV)", data=disc_buffer.getvalue(), file_name="apex_smartbill_discrepante.csv", mime="text/csv")
 
 else:
     st.info("Încarcă APEX (XLSX/XLS/CSV) pentru normalizare și fișierul SmartBill (.xlsx/.xls) pentru mapare.")
